@@ -1,0 +1,1487 @@
+require "import"
+import "android.widget.*"
+import "com.androlua.*"
+import "android.os.Handler"
+import "android.os.Looper"
+import "android.os.Environment"
+import "android.os.ParcelFileDescriptor"
+import "android.content.Intent"
+import "android.net.Uri"
+import "android.util.Base64"
+import "android.graphics.Bitmap"
+import "android.graphics.Color"
+import "android.graphics.pdf.PdfRenderer"
+import "android.speech.SpeechRecognizer"
+import "android.speech.RecognizerIntent"
+import "android.speech.RecognitionListener"
+import "java.io.File"
+import "java.io.FileOutputStream"
+import "android.graphics.pdf.PdfDocument"
+import "android.text.StaticLayout"
+import "android.text.TextPaint"
+import "android.text.Layout"
+import "java.io.ByteArrayOutputStream"
+import "java.io.BufferedReader"
+import "java.io.InputStreamReader"
+import "java.net.URL"
+import "java.lang.Thread"
+import "java.lang.Runnable"
+import "java.lang.String"
+import "java.lang.StringBuilder"
+import "java.lang.reflect.Array"
+import "org.json.JSONObject"
+import "org.json.JSONArray"
+
+------------------------------------------------------------
+-- App Information
+------------------------------------------------------------
+local APP = "AI PDF Reader"
+local DEV = "Developed by Qari Fahad and Noman Khan"
+local VER = "Version 5.0 (Pro Masterpiece)"
+
+------------------------------------------------------------
+-- Settings & History Storage
+------------------------------------------------------------
+local cfgPath = luajava.luadir .. "/config.txt"
+local chatFile = luajava.luadir .. "/chat_history.json"
+local recentFile = luajava.luadir .. "/recent_pdfs.json"
+
+local cfg = { provider = "Gemini", gkey = "", mkey = "", gmodel = "gemini-2.5-flash", mmodel = "pixtral-12b-2409", lang = "Urdu" }
+local MAXP = 40 
+
+local chatSessions = {}
+local chatState = { mode = 0, sessionId = nil }
+local recentPdfs = {}
+
+------------------------------------------------------------
+-- Load & Save Data
+------------------------------------------------------------
+local function loadRecents()
+  local f = io.open(recentFile, "r")
+  if f then
+    local data = f:read("*a")
+    f:close()
+    pcall(function()
+      local arr = JSONArray(data)
+      recentPdfs = {}
+      for i=0, arr.length()-1 do
+        local obj = arr.getJSONObject(i)
+        recentPdfs[#recentPdfs+1] = { path = obj.getString("path"), name = obj.getString("name"), page = obj.getInt("page") }
+      end
+    end)
+  end
+end
+
+local function saveRecents()
+  pcall(function()
+    local arr = JSONArray()
+    for _, r in ipairs(recentPdfs) do
+      local obj = JSONObject()
+      obj.put("path", r.path)
+      obj.put("name", r.name)
+      obj.put("page", r.page)
+      arr.put(obj)
+    end
+    local f = io.open(recentFile, "w")
+    if f then f:write(arr.toString()) f:close() end
+  end)
+end
+
+local function updateRecent(path, name, page)
+  if not path then return end
+  local idx = -1
+  for i, r in ipairs(recentPdfs) do
+    if r.path == path then idx = i break end
+  end
+  if idx > 0 then table.remove(recentPdfs, idx) end
+  table.insert(recentPdfs, 1, {path=path, name=name, page=page})
+  if #recentPdfs > 5 then table.remove(recentPdfs, 6) end
+  saveRecents()
+end
+
+local function loadChats()
+  local f = io.open(chatFile, "r")
+  if f then
+    local data = f:read("*a")
+    f:close()
+    pcall(function()
+      local arr = JSONArray(data)
+      chatSessions = {}
+      for i=0, arr.length()-1 do
+        local obj = arr.getJSONObject(i)
+        local session = { id = obj.getString("id"), title = obj.getString("title"), msgs = {} }
+        local marr = obj.getJSONArray("msgs")
+        for j=0, marr.length()-1 do
+          local mobj = marr.getJSONObject(j)
+          session.msgs[#session.msgs+1] = { role = mobj.getString("role"), text = mobj.getString("text") }
+        end
+        chatSessions[#chatSessions+1] = session
+      end
+    end)
+  end
+end
+
+local function saveChats()
+  pcall(function()
+    local arr = JSONArray()
+    for _, s in ipairs(chatSessions) do
+      local obj = JSONObject()
+      obj.put("id", s.id)
+      obj.put("title", s.title)
+      local marr = JSONArray()
+      for _, m in ipairs(s.msgs) do
+        local mobj = JSONObject()
+        mobj.put("role", m.role)
+        mobj.put("text", m.text)
+        marr.put(mobj)
+      end
+      obj.put("msgs", marr)
+      arr.put(obj)
+    end
+    local f = io.open(chatFile, "w")
+    if f then f:write(arr.toString()) f:close() end
+  end)
+end
+
+local function loadCfg()
+  local f = io.open(cfgPath, "r")
+  if f then
+    for line in f:lines() do
+      local k, v = line:match("^(%w+)=(.*)$")
+      if k then cfg[k] = v end
+    end
+    f:close()
+  end
+  
+  if not cfg.provider or (cfg.provider ~= "Gemini" and cfg.provider ~= "Mistral") then
+    cfg.provider = "Gemini"
+  end
+  
+  local validGemini = { ["gemini-2.5-pro"] = true, ["gemini-2.5-flash"] = true, ["gemini-2.0-flash-exp"] = true }
+  if not validGemini[cfg.gmodel] then cfg.gmodel = "gemini-2.5-flash" end
+  
+  local validMistral = { 
+    ["pixtral-12b-2409"] = true, 
+    ["pixtral-large-latest"] = true,
+    ["mistral-large-latest"] = true,
+    ["mistral-small-latest"] = true
+  }
+  if not validMistral[cfg.mmodel] then cfg.mmodel = "pixtral-12b-2409" end
+  
+  loadChats()
+  loadRecents()
+end
+
+local function saveCfg()
+  local f = io.open(cfgPath, "w")
+  if f then
+    for k, v in pairs(cfg) do f:write(k .. "=" .. v .. "\n") end
+    f:close()
+  end
+end
+
+local function activeProvider() return cfg.provider end
+local function activeModel()
+  if cfg.provider == "Gemini" then return cfg.gmodel else return cfg.mmodel end
+end
+
+------------------------------------------------------------
+-- PDF State & Utility
+------------------------------------------------------------
+local pdf = { path = nil, name = nil, renderer = nil, pages = 0, cur = 1, cache = {} }
+local mainRefs = {}
+
+local function statusText()
+  if pdf.renderer then
+    return "PDF: " .. tostring(pdf.name) .. "  |  Page " .. pdf.cur .. " / " .. pdf.pages
+  end
+  return "No PDF currently open"
+end
+
+local function refreshStatus()
+  if mainRefs.stat then pcall(function() mainRefs.stat.setText(statusText()) end) end
+end
+
+local function shareText(txt)
+  local i = Intent(Intent.ACTION_SEND)
+  i.setType("text/plain")
+  i.putExtra(Intent.EXTRA_TEXT, String(txt))
+  this.startActivity(Intent.createChooser(i, "Share via..."))
+end
+
+------------------------------------------------------------
+-- Text Dialog (Listen, Copy, Share)
+------------------------------------------------------------
+local function textDialog(title, text, speakText)
+  local layout = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", layout_height = "fill",
+    { LinearLayout, orientation = "horizontal", layout_width = "fill",
+      { Button, id = "tdListen", text = "Listen (TTS)", layout_weight = 1, layout_width = "0dp" },
+      { Button, id = "tdCopy", text = "Copy", layout_weight = 1, layout_width = "0dp" },
+      { Button, id = "tdShare", text = "Share", layout_weight = 1, layout_width = "0dp" },
+    },
+    { ScrollView, layout_width = "fill", layout_height = "fill",
+      { TextView, id = "tdText", text = text, textSize = "16sp", padding = "12dp", layout_width = "fill" } },
+  }
+  local dlg = LuaDialog(this)
+  dlg.View = loadlayout(layout)
+  local bListen, bCopy, bShare = tdListen, tdCopy, tdShare
+  dlg.setTitle(title)
+  dlg.setButton("Close", nil)
+  bListen.onClick = function() service.speak(speakText or text) end
+  bCopy.onClick = function()
+    service.copy(text)
+    service.speak("Copied to clipboard")
+  end
+  bShare.onClick = function() shareText(text) end
+  dlg.show()
+  service.speak(speakText or text)
+end
+
+------------------------------------------------------------
+-- Error Dialog
+------------------------------------------------------------
+local function errDialog(where, err)
+  local report = APP .. " " .. VER ..
+      "\nTime: " .. os.date("%Y-%m-%d %H:%M:%S") ..
+      "\nLocation: " .. tostring(where) ..
+      "\nProvider: " .. activeProvider() ..
+      "\nModel: " .. tostring(activeModel()) ..
+      "\nPDF: " .. tostring(pdf.path) ..
+      "\nPage: " .. tostring(pdf.cur) .. " / " .. tostring(pdf.pages) ..
+      "\n\nDetails:\n" .. tostring(err)
+  textDialog("Error Report", report, "An error occurred. Details are in the dialog. Please copy and share.")
+end
+
+local function fail(msg, where) errDialog(where or "App", msg) end
+
+------------------------------------------------------------
+-- Thread Helpers
+------------------------------------------------------------
+local handler = Handler(Looper.getMainLooper())
+local function ui(fn)
+  handler.post(Runnable { run = function()
+    local ok, e = pcall(fn)
+    if not ok then errDialog("UI", e) end
+  end })
+end
+local function bg(fn)
+  Thread(Runnable { run = function()
+    local ok, e = pcall(fn)
+    if not ok then ui(function() errDialog("Background", e) end) end
+  end }).start()
+end
+
+------------------------------------------------------------
+-- Design: Header + List Dialog
+------------------------------------------------------------
+local function header()
+  return {
+    LinearLayout, orientation = "vertical", layout_width = "fill", padding = "16dp",
+    backgroundColor = "#FF1A237E",
+    { TextView, text = APP, textSize = "26sp", textColor = "#FFFFFFFF", gravity = "center", layout_width = "fill" },
+    { TextView, text = DEV, textSize = "14sp", textColor = "#FFC5CAE9", gravity = "center", layout_width = "fill" },
+    { TextView, text = VER, textSize = "12sp", textColor = "#FF9FA8DA", gravity = "center", layout_width = "fill" },
+  }
+end
+
+local function newListDialog(subtitle, items)
+  local layout = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", layout_height = "fill",
+    header(),
+    { TextView, id = "ldSub", text = subtitle, textSize = "17sp", textColor = "#FF1A237E", padding = "12dp", layout_width = "fill" },
+    { GridView, id = "ldGrid", numColumns = 1, layout_width = "fill", layout_height = "fill" },
+  }
+  local dlg = LuaDialog(this)
+  dlg.View = loadlayout(layout)
+  local g, sub = ldGrid, ldSub
+  g.adapter = SingleLineAdapter(service, String(items))
+  dlg.setTitle(APP .. " - " .. subtitle)
+  dlg.setButton("Close", nil)
+  return dlg, g, sub
+end
+
+local function pickFrom(subtitle, items, onPick)
+  local dlg, g = newListDialog(subtitle, items)
+  dlg.show()
+  g.onItemClick = function(l, v)
+    dlg.dismiss()
+    local ok, e = pcall(onPick, tostring(v.text))
+    if not ok then errDialog("Selection: " .. tostring(v.text), e) end
+  end
+end
+
+local function input(title, hint, defText, onOk)
+  local layout = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", padding = "12dp",
+    { EditText, id = "inp", layout_width = "fill", hint = hint },
+  }
+  local dlg = LuaDialog(this)
+  dlg.View = loadlayout(layout)
+  local box = inp
+  box.setText(defText or "")
+  dlg.setTitle(title)
+  dlg.setButton("OK", function()
+    local ok, e = pcall(onOk, tostring(box.getText()))
+    if not ok then errDialog("Input: " .. title, e) end
+  end)
+  dlg.setButton2("Cancel", nil)
+  dlg.show()
+end
+
+------------------------------------------------------------
+-- Gemini & Mistral AI Engine
+------------------------------------------------------------
+local function msg(role, text, img) return { role = role, text = text, img = img } end
+
+local function askAi(msgs, cb)
+  local p = cfg.provider
+  local k = (p == "Gemini" and cfg.gkey or cfg.mkey)
+  local m = activeModel()
+
+  if k == "" then
+    cb(nil, p .. " API key is not set.\nPlease go to Main Menu -> AI Settings to configure.")
+    return
+  end
+
+  bg(function()
+    local ok, r1, r2 = pcall(function()
+      local body = JSONObject()
+      local endpoint = ""
+      
+      if p == "Mistral" then
+        endpoint = "https://api.mistral.ai/v1/chat/completions"
+        body.put("model", m)
+        local arr = JSONArray()
+        for _, mobj in ipairs(msgs) do
+           local obj = JSONObject()
+           obj.put("role", mobj.role)
+           if mobj.img then
+              local contentArr = JSONArray()
+              local p1 = JSONObject()
+              p1.put("type", "image_url")
+              local iu = JSONObject()
+              iu.put("url", "data:image/jpeg;base64," .. mobj.img)
+              p1.put("image_url", iu)
+              contentArr.put(p1)
+              local p2 = JSONObject()
+              p2.put("type", "text")
+              p2.put("text", mobj.text)
+              contentArr.put(p2)
+              obj.put("content", contentArr)
+           else
+              obj.put("content", mobj.text)
+           end
+           arr.put(obj)
+        end
+        body.put("messages", arr)
+      else
+        -- Gemini API logic
+        endpoint = "https://generativelanguage.googleapis.com/v1beta/models/" .. m .. ":generateContent?key=" .. k
+        local contents = JSONArray()
+        local sysText = ""
+        for _, mobj in ipairs(msgs) do
+           if mobj.role == "system" then
+              sysText = sysText .. mobj.text .. "\n"
+           else
+              local obj = JSONObject()
+              local r = mobj.role
+              if r == "assistant" then r = "model" end
+              obj.put("role", r)
+              
+              local partsArr = JSONArray()
+              if mobj.text and mobj.text ~= "" then
+                 local tPart = JSONObject()
+                 tPart.put("text", mobj.text)
+                 partsArr.put(tPart)
+              end
+              if mobj.img then
+                 local iPart = JSONObject()
+                 local inlineData = JSONObject()
+                 inlineData.put("mimeType", "image/jpeg")
+                 inlineData.put("data", mobj.img)
+                 iPart.put("inlineData", inlineData)
+                 partsArr.put(iPart)
+              end
+              obj.put("parts", partsArr)
+              contents.put(obj)
+           end
+        end
+        body.put("contents", contents)
+        if sysText ~= "" then
+           local sysObj = JSONObject()
+           local sysParts = JSONArray()
+           local sysPartObj = JSONObject()
+           sysPartObj.put("text", sysText)
+           sysParts.put(sysPartObj)
+           sysObj.put("parts", sysParts)
+           body.put("systemInstruction", sysObj)
+        end
+      end
+
+      local c = URL(endpoint).openConnection()
+      c.setRequestProperty("User-Agent", "AIPDFReader/5.0")
+      c.setRequestProperty("Accept", "application/json")
+      c.setRequestMethod("POST")
+      c.setRequestProperty("Content-Type", "application/json")
+      if p == "Mistral" then
+        c.setRequestProperty("Authorization", "Bearer " .. k)
+      end
+      c.setConnectTimeout(30000)
+      c.setReadTimeout(180000)
+      c.setDoOutput(true)
+      
+      local out = c.getOutputStream()
+      out.write(String(body.toString()).getBytes("UTF-8"))
+      out.close()
+      
+      local code = c.getResponseCode()
+      local stream
+      if code < 400 then stream = c.getInputStream() else stream = c.getErrorStream() end
+      local reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+      local sb = StringBuilder()
+      local line = reader.readLine()
+      while line do
+        sb.append(line)
+        sb.append("\n")
+        line = reader.readLine()
+      end
+      reader.close()
+      
+      local txt = tostring(sb.toString())
+      if code >= 400 then return nil, p .. " API error " .. code .. ": " .. txt end
+      
+      local j = JSONObject(txt)
+      local content = ""
+      if p == "Mistral" then
+        content = j.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+      else
+        content = j.getJSONArray("candidates").getJSONObject(0).getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+      end
+      return tostring(content)
+    end)
+    local result, err
+    if ok then result, err = r1, r2 else err = "Network Error: " .. tostring(r1) end
+    ui(function() cb(result, err) end)
+  end)
+end
+
+------------------------------------------------------------
+-- PDF Rendering & Extraction
+------------------------------------------------------------
+local function openPdf(path)
+  pcall(function() if pdf.renderer then pdf.renderer.close() end end)
+  local ok, err = pcall(function()
+    local pfd = ParcelFileDescriptor.open(File(path), ParcelFileDescriptor.MODE_READ_ONLY)
+    local r = PdfRenderer(pfd)
+    pdf.renderer = r
+    pdf.pages = r.getPageCount()
+    pdf.path = path
+    pdf.name = tostring(File(path).getName())
+    pdf.cur = 1
+    pdf.cache = {}
+  end)
+  return ok, err
+end
+
+local function pageImage(n)
+  local page = pdf.renderer.openPage(n - 1)
+  local w = math.floor(page.getWidth() * 2)
+  local h = math.floor(page.getHeight() * 2)
+  local bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+  bmp.eraseColor(Color.WHITE)
+  page.render(bmp, nil, nil, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+  page.close()
+  local baos = ByteArrayOutputStream()
+  bmp.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+  bmp.recycle()
+  return Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+end
+
+local function extractPage(n, cb)
+  if pdf.cache[n] then cb(pdf.cache[n]) return end
+  bg(function()
+    local ok, img = pcall(pageImage, n)
+    if not ok then
+      ui(function() cb(nil, "Page render failed: " .. tostring(img)) end)
+      return
+    end
+    askAi({
+      msg("system", "You are an accurate OCR and text extraction engine."),
+      msg("user", "Extract ALL text from this PDF page exactly as written, in reading order. Keep the original language and script. Output only the text, no commentary. If the page has no text, describe it in one short sentence.", img),
+    }, function(t, e)
+      if t then pdf.cache[n] = t end
+      cb(t, e)
+    end)
+  end)
+end
+
+local function needPdf()
+  if pdf.renderer then return false end
+  service.speak("Please open a PDF first")
+  return true
+end
+
+local function docText(cb)
+  local last = math.min(pdf.pages, MAXP)
+  local parts, n = {}, 1
+  local function step()
+    if n > last then cb(table.concat(parts, "\n\n")) return end
+    service.asyncSpeak("Page " .. n)
+    extractPage(n, function(t, e)
+      if not t then fail(e, "Entire PDF Text: Page " .. n) return end
+      parts[#parts + 1] = "--- Page " .. n .. " ---\n" .. t
+      n = n + 1
+      step()
+    end)
+  end
+  step()
+end
+
+------------------------------------------------------------
+-- Features (Read, Translate, Summary, TTS, Smart Dict)
+------------------------------------------------------------
+local function readPage(n)
+  if needPdf() then return end
+  if n < 1 or n > pdf.pages then
+    service.speak("This page does not exist. Total pages: " .. pdf.pages)
+    return
+  end
+  pdf.cur = n
+  updateRecent(pdf.path, pdf.name, pdf.cur)
+  refreshStatus()
+  service.speak("Extracting text from Page " .. n .. ", please wait...")
+  extractPage(n, function(t, e)
+    if not t then fail(e, "Read Page") return end
+    textDialog("Page " .. n .. " / " .. pdf.pages, t)
+  end)
+end
+
+local langs = { "Urdu", "English", "Hindi", "Arabic", "Persian", "Punjabi", "Pashto", "Sindhi", "French", "German", "Spanish", "Turkish", "Chinese", "Russian", "Japanese" }
+
+local function pickLangThen(subtitle, allowOriginal, fn)
+  local items = {}
+  if allowOriginal then items[#items + 1] = "Original Language (of the PDF)" end
+  for _, l in ipairs(langs) do
+    if l == cfg.lang then items[#items + 1] = l .. " (previous)" else items[#items + 1] = l end
+  end
+  pickFrom(subtitle, items, function(t)
+    if t == "Original Language (of the PDF)" then fn(nil) return end
+    local l = (t:gsub(" %(previous%)$", ""))
+    cfg.lang = l
+    saveCfg()
+    fn(l)
+  end)
+end
+
+local function translate(text, lang, cb)
+  askAi({
+    msg("system", "You are an expert professional translator. Translate the following text strictly into pure, natural " .. lang .. ". If translating into Urdu, use ONLY the proper Urdu script (Nastaliq). Do NOT use Roman English, and find proper translated equivalents for all English words so that the final output is 100% pure " .. lang .. " script. Output ONLY the translated text without any explanation."),
+    msg("user", text),
+  }, cb)
+end
+
+local function translatePage()
+  if needPdf() then return end
+  pickLangThen("Translate this page: To which language?", false, function(lang)
+    service.speak("Translating, please wait...")
+    extractPage(pdf.cur, function(t, e)
+      if not t then fail(e, "Translation: Text extraction") return end
+      translate(t, lang, function(r, e2)
+        if not r then fail(e2, "Translation") return end
+        textDialog("Page " .. pdf.cur .. " Translation (" .. lang .. ")", r)
+      end)
+    end)
+  end)
+end
+
+local function translateAll()
+  if needPdf() then return end
+  pickLangThen("Translate entire PDF: To which language?", false, function(lang)
+    local last = math.min(pdf.pages, MAXP)
+    local outs, n = {}, 1
+    local function step()
+      if n > last then
+        textDialog("Entire PDF Translation (" .. lang .. ")", table.concat(outs, "\n\n"))
+        return
+      end
+      service.asyncSpeak("Page " .. n)
+      extractPage(n, function(t, e)
+        if not t then fail(e, "Entire PDF Translation: Page " .. n) return end
+        translate(t, lang, function(r, e2)
+          if not r then fail(e2, "Entire PDF Translation: Page " .. n) return end
+          outs[#outs + 1] = "--- Page " .. n .. " ---\n" .. r
+          n = n + 1
+          step()
+        end)
+      end)
+    end
+    step()
+  end)
+end
+
+local function summarize(text, title, lang)
+  local where = lang and (" in " .. lang) or " in the same language as the text"
+  askAi({
+    msg("system", "Summarize the given text clearly" .. where .. ", using short points. Output only the summary."),
+    msg("user", text),
+  }, function(r, e)
+    if not r then fail(e, "Summary") return end
+    textDialog(title, r)
+  end)
+end
+
+local function summaryPage()
+  if needPdf() then return end
+  pickLangThen("Summary of this page: In which language?", true, function(lang)
+    service.speak("Generating summary, please wait...")
+    extractPage(pdf.cur, function(t, e)
+      if not t then fail(e, "Summary: Text extraction") return end
+      summarize(t, "Summary of Page " .. pdf.cur, lang)
+    end)
+  end)
+end
+
+local function summaryAll()
+  if needPdf() then return end
+  pickLangThen("Summary of entire PDF: In which language?", true, function(lang)
+    service.speak("Generating summary for the entire PDF, this may take some time...")
+    docText(function(all) summarize(all, "Summary of Entire PDF", lang) end)
+  end)
+end
+
+local function readAll()
+  if needPdf() then return end
+  service.speak("Extracting text from entire PDF, this may take some time...")
+  docText(function(all) textDialog("Entire PDF Text", all) end)
+end
+
+local function gotoPage()
+  if needPdf() then return end
+  input("Page number (1 to " .. pdf.pages .. ")", "Page number", tostring(pdf.cur), function(s)
+    local n = tonumber(s)
+    if n then readPage(math.floor(n)) else service.speak("Please enter a valid number") end
+  end)
+end
+
+local function openTtsPlayer()
+  if needPdf() then return end
+  local p = pdf.cur
+  local layout = {
+     LinearLayout, orientation="vertical", layout_width="fill", layout_height="fill", padding="12dp",
+     { TextView, id="ttsStatus", text="Loading page...", textSize="18sp", textColor="#FF1A237E", layout_width="fill" },
+     { ScrollView, layout_width="fill", layout_weight=1,
+       { TextView, id="ttsText", text="", textSize="16sp", padding="8dp", layout_width="fill" }
+     },
+     { LinearLayout, orientation="horizontal", layout_width="fill",
+        { Button, id="btnPrev", text="Previous", layout_weight=1 },
+        { Button, id="btnPlay", text="Play (TTS)", layout_weight=1 },
+        { Button, id="btnNext", text="Next", layout_weight=1 }
+     }
+  }
+  local dlg = LuaDialog(this)
+  dlg.View = loadlayout(layout)
+  dlg.setTitle("TTS Player (Listen to PDF)")
+  dlg.setButton("Close", nil)
+  
+  local tvStat, tvText = ttsStatus, ttsText
+  local function loadP(n)
+     if n < 1 or n > pdf.pages then service.speak("No more pages available") return end
+     p = n
+     pdf.cur = n
+     updateRecent(pdf.path, pdf.name, pdf.cur)
+     refreshStatus()
+     tvStat.setText("Loading Page " .. p .. " / " .. pdf.pages .. "...")
+     tvText.setText("")
+     service.speak("Page " .. p)
+     extractPage(p, function(t,e)
+        if t then 
+           tvText.setText(t)
+           tvStat.setText("Page " .. p .. " / " .. pdf.pages)
+           service.speak(t)
+        else
+           tvStat.setText("Error!")
+           fail(e, "TTS Player")
+        end
+     end)
+  end
+  
+  btnPrev.onClick = function() loadP(p-1) end
+  btnNext.onClick = function() loadP(p+1) end
+  btnPlay.onClick = function() 
+    local txt = tostring(tvText.getText())
+    if txt ~= "" then service.speak(txt) else service.speak("Text not loaded yet") end
+  end
+  
+  dlg.show()
+  loadP(p)
+end
+
+local function openDictionary()
+  input("Smart Dictionary", "Enter a word or phrase", "", function(word)
+    if word == "" then return end
+    service.speak("Finding meaning, please wait...")
+    askAi({
+      msg("system", "You are a helpful dictionary assistant. Explain the following word or phrase simply and clearly in " .. cfg.lang .. ". Give a short definition and one example sentence. Output only the definition and example."),
+      msg("user", word),
+    }, function(r, e)
+      if not r then fail(e, "Dictionary") return end
+      textDialog("Dictionary: " .. word, r)
+    end)
+  end)
+end
+
+------------------------------------------------------------
+-- Voice Recognition
+------------------------------------------------------------
+local function listen(cb)
+  service.speak("Speak now")
+  handler.postDelayed(Runnable { run = function()
+    local ok, err = pcall(function()
+      local sr = SpeechRecognizer.createSpeechRecognizer(service)
+      local it = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+      it.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+      sr.setRecognitionListener(RecognitionListener {
+        onReadyForSpeech = function(p) end,
+        onBeginningOfSpeech = function() end,
+        onRmsChanged = function(v) end,
+        onBufferReceived = function(b) end,
+        onEndOfSpeech = function() end,
+        onPartialResults = function(b) end,
+        onEvent = function(t, p) end,
+        onError = function(e)
+          sr.destroy()
+          cb(nil, "Voice not recognized (code " .. tostring(e) .. ")")
+        end,
+        onResults = function(b)
+          local l = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+          sr.destroy()
+          if l and l.size() > 0 then cb(tostring(l.get(0))) else cb(nil, "Nothing heard") end
+        end,
+      })
+      sr.startListening(it)
+    end)
+    if not ok then cb(nil, "Speech recognition failed to start: " .. tostring(err)) end
+  end }, 1200)
+end
+
+------------------------------------------------------------
+-- Chat Pro (WhatsApp Style Bubbles + Long Press)
+------------------------------------------------------------
+local modeNames = { "Chat only (No PDF)", "With current page", "With entire PDF" }
+
+local function getActiveSession()
+  if not chatState.sessionId then
+    local s = { id = tostring(os.time()), title = "Chat " .. os.date("%H:%M"), msgs = {} }
+    chatSessions[#chatSessions+1] = s
+    chatState.sessionId = s.id
+    saveChats()
+    return s
+  end
+  for _, s in ipairs(chatSessions) do
+    if s.id == chatState.sessionId then return s end
+  end
+  local s = { id = tostring(os.time()), title = "Chat " .. os.date("%H:%M"), msgs = {} }
+  chatSessions[#chatSessions+1] = s
+  chatState.sessionId = s.id
+  saveChats()
+  return s
+end
+
+local openChat -- pre-declare
+local function openChatHistory()
+  local labels = {}
+  for _, s in ipairs(chatSessions) do labels[#labels+1] = s.title end
+  
+  if #labels == 0 then 
+    service.speak("No chat history available.")
+    return 
+  end
+  
+  pickFrom("Chat History", labels, function(t)
+    local idx = 0
+    for i, s in ipairs(chatSessions) do if s.title == t then idx = i break end end
+    if idx > 0 then
+      local s = chatSessions[idx]
+      pickFrom(s.title .. " Options", {"Open Chat", "Rename Chat", "Delete Chat"}, function(act)
+        if act == "Open Chat" then
+          chatState.sessionId = s.id
+          service.speak(s.title .. " opened")
+          openChat()
+        elseif act == "Rename Chat" then
+          input("Enter new chat name", "Title", s.title, function(nn)
+            s.title = nn
+            saveChats()
+            service.speak("Name changed successfully")
+            openChatHistory()
+          end)
+        elseif act == "Delete Chat" then
+          table.remove(chatSessions, idx)
+          if chatState.sessionId == s.id then chatState.sessionId = nil end
+          saveChats()
+          service.speak("Chat deleted")
+        end
+      end)
+    end
+  end)
+end
+
+openChat = function()
+  local layout = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", layout_height = "fill", padding = "8dp",
+    { Button, id = "chMode", text = "PDF Context: " .. modeNames[chatState.mode + 1], layout_width = "fill" },
+    { ScrollView, id = "chScroll", layout_width = "fill", layout_weight = 1,
+      { LinearLayout, id = "chLayout", orientation = "vertical", layout_width = "fill" } },
+    { LinearLayout, orientation = "horizontal", layout_width = "fill",
+      { EditText, id = "chIn", hint = "Type here...", layout_weight = 1 },
+      { Button, id = "chVoice", text = "Mic", layout_width = "wrap_content" },
+      { Button, id = "chSend", text = "Send", layout_width = "wrap_content" },
+    },
+  }
+  local dlg = LuaDialog(this)
+  dlg.View = loadlayout(layout)
+  local bMode, box, bSend, bVoice, sc, layoutBox = chMode, chIn, chSend, chVoice, chScroll, chLayout
+  
+  local s = getActiveSession()
+  dlg.setTitle(s.title .. " - AI Chat")
+  dlg.setButton("Close", nil)
+
+  local function renderChat()
+    layoutBox.removeAllViews()
+    local session = getActiveSession()
+    for i, m in ipairs(session.msgs) do
+      local bg = (m.role == "user") and "#FFDCF8C6" or "#FFFFFFFF"
+      local label = (m.role == "user") and "You:" or "AI:"
+      
+      local v = loadlayout({
+        LinearLayout, layout_width="fill", padding="4dp",
+        { TextView, text = label .. "\n" .. m.text, backgroundColor = bg, textColor = "#FF000000", textSize = "16sp", padding = "10dp", layout_width = "fill" }
+      })
+      local tv = v.getChildAt(0)
+      
+      tv.onLongClick = function(view)
+        pickFrom("Message Options", {"Listen (TTS)", "Copy", "Share", "Delete Message"}, function(act)
+          if act == "Listen (TTS)" then service.speak(m.text)
+          elseif act == "Copy" then service.copy(m.text) service.speak("Copied to clipboard")
+          elseif act == "Share" then shareText(m.text)
+          elseif act == "Delete Message" then
+            table.remove(session.msgs, i)
+            saveChats()
+            renderChat()
+            service.speak("Message deleted")
+          end
+        end)
+        return true
+      end
+      layoutBox.addView(v)
+    end
+    sc.post(Runnable { run = function() sc.fullScroll(130) end })
+  end
+
+  local function sendMsg(text)
+    if text == "" then service.speak("Please type something first") return end
+    box.setText("")
+    service.asyncSpeak("AI is thinking...")
+    
+    local session = getActiveSession()
+    session.msgs[#session.msgs+1] = { role = "user", text = text }
+    saveChats()
+    renderChat()
+
+    local function go(ctx)
+      local msgs = { msg("system", "You are a friendly and knowledgeable assistant inside a PDF reader app used through a screen reader. Answer any question or chat about anything. Reply in the same language and script the user writes in. Keep answers clear and easy to listen to.") }
+      if ctx then msgs[#msgs + 1] = msg("system", "The user's open PDF content:\n" .. ctx) end
+      
+      local from = math.max(1, #session.msgs - 19)
+      for i = from, #session.msgs do msgs[#msgs + 1] = msg(session.msgs[i].role, session.msgs[i].text) end
+      
+      askAi(msgs, function(r, e)
+        if not r then fail(e, "Chat") return end
+        session.msgs[#session.msgs+1] = { role = "assistant", text = r }
+        saveChats()
+        renderChat()
+        service.speak(r)
+      end)
+    end
+
+    if chatState.mode > 0 and not pdf.renderer then
+      service.speak("No PDF open, switching to Chat Only mode")
+      go(nil)
+    elseif chatState.mode == 1 then
+      extractPage(pdf.cur, function(t, e)
+        if not t then fail(e, "Chat: Context text extraction") return end
+        go(t)
+      end)
+    elseif chatState.mode == 2 then
+      docText(function(all) go(all) end)
+    else
+      go(nil)
+    end
+  end
+
+  bSend.onClick = function() sendMsg(tostring(box.getText())) end
+  bVoice.onClick = function()
+    listen(function(q, e)
+      if not q then fail(e, "Chat: Voice Input") return end
+      box.setText(q)
+      sendMsg(q)
+    end)
+  end
+  bMode.onClick = function()
+    chatState.mode = (chatState.mode + 1) % 3
+    bMode.setText("PDF Context: " .. modeNames[chatState.mode + 1])
+    service.speak(modeNames[chatState.mode + 1])
+  end
+  
+  dlg.show()
+  renderChat()
+end
+
+------------------------------------------------------------
+-- Creative Content Generator
+------------------------------------------------------------
+local cre = { type = 1, mode = 0, text = "" }
+local creTypes = {
+  "Story", "Essay / Article", "Poem / Poetry", "Letter / Application", "Email",
+  "Speech", "Script / Dialogue", "Notes / Summary", "Quiz / Questions", "Anything (Freeform)"
+}
+
+local function outDir()
+  local d = tostring(Environment.getExternalStorageDirectory().getAbsolutePath()) .. "/Documents/AI PDF Reader"
+  File(d).mkdirs()
+  return d
+end
+
+local function saveTxt(text, path)
+  local out = FileOutputStream(File(path))
+  out.write(String(text).getBytes("UTF-8"))
+  out.close()
+end
+
+local function savePdf(text, path)
+  local PageBuilder = luajava.bindClass("android.graphics.pdf.PdfDocument$PageInfo$Builder")
+  local doc = PdfDocument()
+  local W, H, M = 595, 842, 40
+  local paint = TextPaint()
+  paint.setAntiAlias(true)
+  paint.setColor(Color.BLACK)
+  paint.setTextSize(15)
+  local layout = StaticLayout(text, paint, W - 2 * M, Layout.Alignment.ALIGN_NORMAL, 1.2, 0, false)
+  local usable = H - 2 * M
+  local count = layout.getLineCount()
+  local line, pageNo = 1, 1
+  while line < count do
+    local page = doc.startPage(PageBuilder(W, H, pageNo).create())
+    local canvas = page.getCanvas()
+    local top = layout.getLineTop(line)
+    local last = line
+    while last + 1 < count and layout.getLineBottom(last + 1) - top <= usable do last = last + 1 end
+    local bottom = layout.getLineBottom(last)
+    canvas.save()
+    canvas.translate(M, M - top)
+    canvas.clipRect(0, top, W - 2 * M, bottom)
+    layout.draw(canvas)
+    canvas.restore()
+    doc.finishPage(page)
+    line = last + 1
+    pageNo = pageNo + 1
+  end
+  local out = FileOutputStream(File(path))
+  doc.writeTo(out)
+  out.close()
+  doc.close()
+end
+
+local function doSave(kind, text, name)
+  local n = (name:gsub('[/\\:*?"<>|]', "_"))
+  if n == "" then n = "creation" end
+  local path = outDir() .. "/" .. n .. (kind == "pdf" and ".pdf" or ".txt")
+  if kind == "pdf" then savePdf(text, path) else saveTxt(text, path) end
+  textDialog("Saved successfully", "File saved here:\n" .. path ..
+    "\n\nYou can find it in Internal Storage -> Documents -> AI PDF Reader.",
+    "Saved successfully. Check Documents folder.")
+end
+
+local function openCreative()
+  local layout = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", layout_height = "fill", padding = "8dp",
+    { Button, id = "crType", text = "Type: " .. creTypes[cre.type], layout_width = "fill" },
+    { Button, id = "crMode", text = "PDF Context: " .. modeNames[cre.mode + 1], layout_width = "fill" },
+    { EditText, id = "crIn", hint = "What do you want to create? Write your idea", layout_width = "fill" },
+    { LinearLayout, orientation = "horizontal", layout_width = "fill",
+      { Button, id = "crGen", text = "Generate", layout_width = "0dp", layout_weight = 1 },
+      { Button, id = "crVoice", text = "Voice Input", layout_width = "0dp", layout_weight = 1 },
+      { Button, id = "crEdit", text = "Refine", layout_width = "0dp", layout_weight = 1 },
+    },
+    { LinearLayout, orientation = "horizontal", layout_width = "fill",
+      { Button, id = "crTxt", text = "Save as TXT", layout_width = "0dp", layout_weight = 1 },
+      { Button, id = "crPdf", text = "Save as PDF", layout_width = "0dp", layout_weight = 1 },
+      { Button, id = "crCopy", text = "Copy", layout_width = "0dp", layout_weight = 1 },
+    },
+    { Button, id = "crRead", text = "Read Again", layout_width = "fill" },
+    { ScrollView, layout_width = "fill", layout_height = "fill",
+      { TextView, id = "crText", text = cre.text, textSize = "16sp", padding = "8dp", layout_width = "fill" } },
+  }
+  local dlg = LuaDialog(this)
+  dlg.View = loadlayout(layout)
+  local bType, bMode, box, bGen, bVoice, bEdit = crType, crMode, crIn, crGen, crVoice, crEdit
+  local bTxt, bPdf, bCopy, bRead, tv = crTxt, crPdf, crCopy, crRead, crText
+  dlg.setTitle("Creative AI")
+  dlg.setButton("Close", nil)
+
+  local function done(r)
+    cre.text = r
+    tv.setText(r)
+    service.speak(r)
+  end
+
+  local function generate(idea)
+    if idea == "" then service.speak("Please write your idea first") return end
+    service.speak("AI is generating, please wait...")
+    local function go(ctx)
+      local msgs = { msg("system", "You are a talented, imaginative writing assistant inside an accessibility app. Create exactly what the user asks for, with rich creativity and good structure. Write in the language and script the user writes in, unless they name another language. Output only the finished piece, with no introduction or explanation.") }
+      if ctx then msgs[#msgs + 1] = msg("system", "Use this PDF content as source material:\n" .. ctx) end
+      msgs[#msgs + 1] = msg("user", "Type: " .. creTypes[cre.type] .. "\nRequest: " .. idea)
+      askAi(msgs, function(r, e)
+        if not r then fail(e, "Creative Generation") return end
+        done(r)
+      end)
+    end
+    if cre.mode > 0 and not pdf.renderer then
+      service.speak("No PDF open, generating without PDF context")
+      go(nil)
+    elseif cre.mode == 1 then
+      extractPage(pdf.cur, function(t, e)
+        if not t then fail(e, "Creative: Context text extraction") return end
+        go(t)
+      end)
+    elseif cre.mode == 2 then
+      docText(function(all) go(all) end)
+    else
+      go(nil)
+    end
+  end
+
+  local function refine(instr)
+    if instr == "" then service.speak("Please describe the changes") return end
+    service.speak("Applying changes, please wait...")
+    askAi({
+      msg("system", "You are a talented writing editor. Apply the requested change to the draft and output the complete revised text only, in the same language and script as the draft."),
+      msg("user", "Draft:\n" .. cre.text .. "\n\nChange requested: " .. instr),
+    }, function(r, e)
+      if not r then fail(e, "Creative Refinement") return end
+      done(r)
+    end)
+  end
+
+  local function needText()
+    if cre.text == "" then service.speak("Please generate something first") return true end
+    return false
+  end
+
+  local function askSave(kind)
+    if needText() then return end
+    input("File Name", "Name", "creation_" .. os.date("%Y%m%d_%H%M%S"), function(n) doSave(kind, cre.text, n) end)
+  end
+
+  bType.onClick = function()
+    pickFrom("What kind of content do you want to create?", creTypes, function(t)
+      for i, v in ipairs(creTypes) do if v == t then cre.type = i end end
+      bType.setText("Type: " .. creTypes[cre.type])
+      service.speak(creTypes[cre.type])
+    end)
+  end
+  bMode.onClick = function()
+    cre.mode = (cre.mode + 1) % 3
+    bMode.setText("PDF Context: " .. modeNames[cre.mode + 1])
+    service.speak(modeNames[cre.mode + 1])
+  end
+  bGen.onClick = function() generate(tostring(box.getText())) end
+  bVoice.onClick = function()
+    listen(function(q, e)
+      if not q then fail(e, "Creative Voice Input") return end
+      box.setText(q)
+      generate(q)
+    end)
+  end
+  bEdit.onClick = function()
+    if needText() then return end
+    input("What changes do you want?", "e.g., make it shorter, make it funny", "", refine)
+  end
+  bTxt.onClick = function() askSave("txt") end
+  bPdf.onClick = function() askSave("pdf") end
+  bCopy.onClick = function()
+    if needText() then return end
+    service.copy(cre.text)
+    service.speak("Copied to clipboard")
+  end
+  bRead.onClick = function()
+    if needText() then return end
+    service.speak(cre.text)
+  end
+  dlg.show()
+end
+
+------------------------------------------------------------
+-- Internal Storage Folder Browser & Recent PDFs
+------------------------------------------------------------
+local function sortByName(t)
+  table.sort(t, function(a, b)
+    if a.l == b.l then return a.p < b.p end
+    return a.l < b.l
+  end)
+end
+
+local function loadAndAnnounce(path)
+  local ok, err = openPdf(path)
+  if ok then
+    local savedPage = 1
+    for _, r in ipairs(recentPdfs) do
+      if r.path == path then savedPage = r.page break end
+    end
+    if savedPage > pdf.pages then savedPage = pdf.pages end
+    if savedPage < 1 then savedPage = 1 end
+    pdf.cur = savedPage
+    
+    updateRecent(pdf.path, pdf.name, pdf.cur)
+    refreshStatus()
+    service.speak("PDF opened. " .. pdf.name .. ". Resumed at page " .. pdf.cur .. " of " .. pdf.pages)
+  else
+    fail("Failed to open PDF: " .. tostring(err), "Open PDF")
+  end
+end
+
+local function openBrowser()
+  local root = tostring(Environment.getExternalStorageDirectory().getAbsolutePath())
+  local cur = root
+  local dlg, g, sub = newListDialog("Internal Storage", { "Please wait" })
+  local map = {}
+
+  local function refresh()
+    map = {}
+    local labels = {}
+    local dirs, files = {}, {}
+    local function addDir(n, p) dirs[#dirs + 1] = { n = n, l = n:lower(), p = p } end
+    local list = File(cur).listFiles()
+    if list then
+      for i = 0, Array.getLength(list) - 1 do
+        local f = Array.get(list, i)
+        local n = tostring(f.getName())
+        if n:sub(1, 1) ~= "." then
+          local p = tostring(f.getAbsolutePath())
+          if f.isDirectory() then
+            addDir(n, p)
+          elseif n:lower():match("%.pdf$") then
+            files[#files + 1] = { n = n, l = n:lower(), p = p }
+          end
+        end
+      end
+    end
+    if cur == root then
+      pcall(function()
+        local vols = File("/storage").listFiles()
+        if vols then
+          for i = 0, Array.getLength(vols) - 1 do
+            local vf = Array.get(vols, i)
+            local n = tostring(vf.getName())
+            if n ~= "emulated" and n ~= "self" then addDir("SD card: " .. n, tostring(vf.getAbsolutePath())) end
+          end
+        end
+      end)
+    end
+    sortByName(dirs)
+    sortByName(files)
+    local parent = File(cur).getParent()
+    if cur ~= root and parent and tostring(parent) ~= "/storage" then
+      labels[#labels + 1] = "[..] Go Back"
+    end
+    for _, d in ipairs(dirs) do
+      local label = "[Folder] " .. d.n
+      labels[#labels + 1] = label
+      map[label] = { dir = true, path = d.p, name = d.n }
+    end
+    for _, f in ipairs(files) do
+      labels[#labels + 1] = f.n
+      map[f.n] = { dir = false, path = f.p, name = f.n }
+    end
+    if #dirs == 0 and #files == 0 then labels[#labels + 1] = "(No folders or PDFs in this directory)" end
+    local rel = cur:sub(#root + 1)
+    if rel == "" then rel = "/" end
+    sub.setText("Internal Storage: " .. rel)
+    g.adapter = SingleLineAdapter(service, String(labels))
+    service.speak(#dirs .. " folders and " .. #files .. " PDFs")
+  end
+
+  dlg.show()
+  refresh()
+  g.onItemClick = function(l, v)
+    local t = tostring(v.text)
+    local ok, e = pcall(function()
+      if t == "[..] Go Back" then
+        cur = tostring(File(cur).getParent())
+        refresh()
+      elseif map[t] and map[t].dir then
+        cur = map[t].path
+        refresh()
+      elseif map[t] then
+        dlg.dismiss()
+        loadAndAnnounce(map[t].path)
+      end
+    end)
+    if not ok then errDialog("Folder browser", e) end
+  end
+end
+
+local function openRecentPdfs()
+  if #recentPdfs == 0 then
+    service.speak("No recent PDFs found.")
+    return
+  end
+  local labels = {}
+  for _, r in ipairs(recentPdfs) do
+    labels[#labels + 1] = r.name .. " (Page " .. r.page .. ")"
+  end
+  pickFrom("Recent PDFs", labels, function(t)
+    for _, r in ipairs(recentPdfs) do
+      if t == r.name .. " (Page " .. r.page .. ")" then
+        loadAndAnnounce(r.path)
+        return
+      end
+    end
+  end)
+end
+
+------------------------------------------------------------
+-- AI Settings Menu
+------------------------------------------------------------
+local function openUrl(url)
+  local i = Intent(Intent.ACTION_VIEW)
+  i.setData(Uri.parse(url))
+  this.startActivity(i)
+end
+
+local function selectProvider()
+  pickFrom("Select Provider (Current: " .. cfg.provider .. ")", {"Gemini", "Mistral"}, function(t)
+    cfg.provider = t
+    saveCfg()
+    service.speak(t .. " selected. Please check your API Key and Model.")
+  end)
+end
+
+local function createKey()
+  local p = cfg.provider
+  if p == "Gemini" then
+    openUrl("https://aistudio.google.com/app/apikey")
+    service.speak("Google Gemini website is opening. Click to create a new API key.")
+  else
+    openUrl("https://console.mistral.ai/api-keys/")
+    service.speak("Mistral AI website is opening. Click to create a new API key.")
+  end
+end
+
+local function setKey()
+  local p = cfg.provider
+  local hint = (p == "Gemini") and "AIzaSy..." or "Enter Mistral Key"
+  local curKey = (p == "Gemini") and cfg.gkey or cfg.mkey
+  input("API Key", hint, curKey, function(s)
+    local k = (s:gsub("%s", ""))
+    k = (k:gsub("^[Bb]earer", ""))
+    k = (k:gsub("[\"'`]", ""))
+    if p == "Gemini" then cfg.gkey = k else cfg.mkey = k end
+    saveCfg()
+    service.speak(p .. " API Key saved successfully.")
+  end)
+end
+
+local gModels = {
+  "gemini-2.5-pro (Best PDF/Vision)",
+  "gemini-2.5-flash (Fast aur behtar)",
+  "gemini-2.0-flash-exp (Experimental)",
+}
+local gIds = {
+  [gModels[1]] = "gemini-2.5-pro",
+  [gModels[2]] = "gemini-2.5-flash",
+  [gModels[3]] = "gemini-2.0-flash-exp",
+}
+
+local mModels = {
+  "pixtral-12b-2409 (Tez PDF Vision)",
+  "pixtral-large-latest (Best Vision/PDF)",
+  "mistral-large-latest (Best Chat, No Vision)",
+  "mistral-small-latest (Tez Chat)",
+}
+local mIds = {
+  [mModels[1]] = "pixtral-12b-2409",
+  [mModels[2]] = "pixtral-large-latest",
+  [mModels[3]] = "mistral-large-latest",
+  [mModels[4]] = "mistral-small-latest",
+}
+
+local function selectModel()
+  local p = cfg.provider
+  local list, ids, curModel = gModels, gIds, cfg.gmodel
+  if p == "Mistral" then list, ids, curModel = mModels, mIds, cfg.mmodel end
+  
+  local items = {}
+  for _, l in ipairs(list) do
+    if ids[l] == curModel then items[#items + 1] = l .. " (current)" else items[#items + 1] = l end
+  end
+  
+  pickFrom("Select Model", items, function(t)
+    local plain = (t:gsub(" %(current%)$", ""))
+    local id = ids[plain]
+    if id then
+      if p == "Gemini" then cfg.gmodel = id else cfg.mmodel = id end
+      saveCfg()
+      service.speak("Model set successfully")
+    end
+  end)
+end
+
+local function testKey()
+  service.speak("API test in progress, please wait...")
+  askAi({ msg("user", "Reply with exactly the word: OK") }, function(r, e)
+    if not r then fail(e, "API key test") return end
+    textDialog("API key test", "Success! API key is working perfectly.\nProvider: " .. cfg.provider ..
+      "\nModel: " .. activeModel() ..
+      "\nResponse: " .. r,
+      "Success! API key is working perfectly.")
+  end)
+end
+
+local function openAiSettings()
+  local menuActions = {
+    { "1. Select Provider (Gemini / Mistral)", selectProvider },
+    { "2. Select Model (From List)", selectModel },
+    { "3. Create New API Key (Website)", createKey },
+    { "4. Enter your API Key", setKey },
+    { "5. Test API Key", testKey },
+  }
+  local labels = {}
+  for _, a in ipairs(menuActions) do labels[#labels + 1] = a[1] end
+  local dlg, g = newListDialog("AI Settings", labels)
+  dlg.show()
+  g.onItemClick = function(l, v)
+    local t = tostring(v.text)
+    for _, a in ipairs(menuActions) do
+      if a[1] == t then
+        local ok, e = pcall(a[2])
+        if not ok then errDialog("AI Settings: " .. t, e) end
+        return
+      end
+    end
+  end
+end
+
+------------------------------------------------------------
+-- NEW MAIN MENU
+------------------------------------------------------------
+local function openAbout()
+  local layout = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", padding = "16dp",
+    { TextView, text = APP .. "\n" .. VER, textSize = "20sp", textColor = "#FF1A237E", gravity = "center", layout_width = "fill" },
+    { TextView, text = DEV, textSize = "16sp", padding = "8dp", gravity = "center", layout_width = "fill" },
+    { Button, id = "btnWa", text = "Contact Developer (WhatsApp)", layout_width = "fill" },
+  }
+  local dlg = LuaDialog(this)
+  dlg.View = loadlayout(layout)
+  dlg.setTitle("About App")
+  dlg.setButton("Close", nil)
+  btnWa.onClick = function()
+    local i = Intent(Intent.ACTION_VIEW)
+    i.setData(Uri.parse("https://wa.me/923117168095"))
+    this.startActivity(i)
+  end
+  dlg.show()
+  service.speak("About App. " .. DEV .. ". WhatsApp button available.")
+end
+
+local function openMainMenu()
+  local menuActions = {
+    { "Start New Chat", function() chatState.sessionId = nil openChat() end },
+    { "Chat History", openChatHistory },
+    { "AI Settings (API, Model, Keys)", openAiSettings },
+    { "About App & Contact Developer", openAbout },
+  }
+  local labels = {}
+  for _, a in ipairs(menuActions) do labels[#labels + 1] = a[1] end
+  local dlg, g = newListDialog("Main Menu", labels)
+  dlg.show()
+  g.onItemClick = function(l, v)
+    local t = tostring(v.text)
+    dlg.dismiss()
+    for _, a in ipairs(menuActions) do
+      if a[1] == t then
+        local ok, e = pcall(a[2])
+        if not ok then errDialog("Main Menu: " .. t, e) end
+        return
+      end
+    end
+  end
+end
+
+------------------------------------------------------------
+-- Main Screen UI
+------------------------------------------------------------
+local actions = {
+  { "Open PDF from Internal Storage", openBrowser },
+  { "Recent PDFs (Resume Reading)", openRecentPdfs },
+  { "Read this page", function() readPage(pdf.cur) end },
+  { "Next Page", function() readPage(pdf.cur + 1) end },
+  { "Previous Page", function() readPage(pdf.cur - 1) end },
+  { "Go to Page Number", gotoPage },
+  { "Listen to PDF (TTS Player)", openTtsPlayer },
+  { "Smart Dictionary (Quick Meaning)", openDictionary },
+  { "Translate this page", translatePage },
+  { "Translate entire PDF", translateAll },
+  { "Summary of this page", summaryPage },
+  { "Summary of entire PDF", summaryAll },
+  { "Read entire PDF", readAll },
+  { "Chat: Ask AI about PDF or anything", function() openChat() end },
+  { "Creative: Generate and save content", openCreative },
+}
+
+local function showMain()
+  local labels = {}
+  for _, a in ipairs(actions) do labels[#labels + 1] = a[1] end
+  local layout = {
+    LinearLayout, orientation = "vertical", layout_width = "fill", layout_height = "fill",
+    header(),
+    { TextView, id = "mnStat", text = statusText(), textSize = "16sp", textColor = "#FF1A237E", padding = "12dp", layout_width = "fill" },
+    { Button, id = "mnMenu", text = "Main Menu", layout_width = "fill", textColor = "#FFFFFFFF", backgroundColor = "#FF3F51B5" },
+    { GridView, id = "mnGrid", numColumns = 1, layout_width = "fill", layout_height = "fill" },
+  }
+  local dlg = LuaDialog(this)
+  dlg.View = loadlayout(layout)
+  local stat, btnMenu, g = mnStat, mnMenu, mnGrid
+  mainRefs.stat = stat
+  g.adapter = SingleLineAdapter(service, String(labels))
+  dlg.setTitle(APP)
+  dlg.setButton("Close", nil)
+  btnMenu.onClick = function()
+    local ok, e = pcall(openMainMenu)
+    if not ok then errDialog("Main Menu Error", e) end
+  end
+  g.onItemClick = function(l, v)
+    local t = tostring(v.text)
+    for _, a in ipairs(actions) do
+      if a[1] == t then
+        local ok, e = pcall(a[2])
+        if not ok then errDialog(t, e) end
+        return
+      end
+    end
+  end
+  dlg.show()
+end
+
+------------------------------------------------------------
+-- App Startup
+------------------------------------------------------------
+local ok, e = pcall(function()
+  loadCfg()
+  showMain()
+  -- User requested to NOT auto-open folder browser on startup.
+  -- Only showMain() is executed now.
+end)
+if not ok then errDialog("Startup", e) end
